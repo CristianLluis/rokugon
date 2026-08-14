@@ -1,0 +1,30 @@
+[project]
+name = "rokugon"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = ["fastapi[standard]"]
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.fastapi]
+entrypoint = "app.main:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+cache-dir = "/tmp/rokugon/ruff_cache"
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["B", "DJ", "E", "F", "I", "SIM", "UP", "W", "Q"]
+ignore = ["SIM108", "DJ008"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+lines-after-imports = 2
+known-first-party = ["app"]
+from-first = false
+case-sensitive = false

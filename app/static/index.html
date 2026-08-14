@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rokugon</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #111111;
+      }
+
+      canvas {
+        display: block;
+      }
+
+      #tile-titles {
+        position: fixed;
+        inset: 0;
+        z-index: 5;
+        pointer-events: none;
+      }
+
+      .tile-title {
+        position: absolute;
+        clip-path: polygon(100% 50%, 75% 93.3%, 25% 93.3%, 0 50%, 25% 6.7%, 75% 6.7%);
+        pointer-events: auto;
+      }
+
+      #map-info {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 10;
+        display: grid;
+        gap: 4px;
+        min-width: 160px;
+        padding: 10px 12px;
+        border: 1px solid rgb(255 255 255 / 0.2);
+        border-radius: 8px;
+        color: #ffffff;
+        background: rgb(20 20 20 / 0.72);
+        font: 600 13px/1.25 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        user-select: text;
+        backdrop-filter: blur(12px);
+      }
+
+      .map-info-row {
+        display: flex;
+        gap: 8px;
+        justify-content: space-between;
+      }
+
+      .map-info-label {
+        color: rgb(255 255 255 / 0.68);
+      }
+
+      .controls {
+        position: fixed;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 10;
+        display: flex;
+        justify-content: center;
+        padding: 16px;
+        pointer-events: none;
+      }
+
+      #generate {
+        min-width: 132px;
+        height: 44px;
+        border: 1px solid rgb(255 255 255 / 0.28);
+        border-radius: 8px;
+        color: #ffffff;
+        background: rgb(20 20 20 / 0.84);
+        font: 600 15px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+        pointer-events: auto;
+        backdrop-filter: blur(12px);
+      }
+
+      #generate:disabled {
+        cursor: wait;
+        opacity: 0.72;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="tile-titles"></div>
+    <div id="map-info">
+      <div class="map-info-row">
+        <span class="map-info-label">Seed</span>
+        <span id="map-seed">-</span>
+      </div>
+      <div class="map-info-row">
+        <span class="map-info-label">Tiles</span>
+        <span id="map-tile-count">0</span>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="generate" type="button">Generate</button>
+    </div>
+
+    <script type="module">
+      import { Application, Assets, Container, Graphics, Sprite } from "https://cdn.jsdelivr.net/npm/pixi.js@8.10.0/dist/pixi.mjs";
+
+      const SQRT_3 = Math.sqrt(3);
+      const TILE_DELAY = 20;
+      const DROP_DURATION = 500;
+      const DROP_DISTANCE = 150;
+      const TILE_ROTATION = Math.PI / 3;
+      const DEFAULT_REQUEST = {
+        retry_limit: 1,
+        backtrack_limit: 300,
+      };
+
+      const HEX_SIZE = {
+        x: 50,
+        y: 50,
+      };
+
+      const app = new Application();
+      await app.init({
+        resizeTo: window,
+        antialias: true,
+        background: "#111111",
+      });
+
+      document.body.appendChild(app.canvas);
+
+      const generateButton = document.querySelector("#generate");
+      const titleLayer = document.querySelector("#tile-titles");
+      const mapSeed = document.querySelector("#map-seed");
+      const mapTileCount = document.querySelector("#map-tile-count");
+      const world = new Container();
+      const activeAnimations = new Set();
+      let currentPlacements = [];
+
+      app.stage.addChild(world);
+      generateButton.addEventListener("click", generateMap);
+      window.addEventListener("resize", () => {
+        if (currentPlacements.length > 0) {
+          centerMap(calculateMapBounds(currentPlacements));
+          positionTitleOverlays();
+        }
+      });
+
+      async function generateMap() {
+        generateButton.disabled = true;
+        generateButton.textContent = "Generating";
+
+        try {
+          clearWorld();
+
+          const response = await fetch("/maps/generate", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(DEFAULT_REQUEST),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Map generation failed: ${response.status}`);
+          }
+
+          const map = await response.json();
+          currentPlacements = map.placements;
+          updateMapInfo(map);
+          await renderPlacements(currentPlacements);
+        } catch (error) {
+          console.error(error);
+        } finally {
+          generateButton.disabled = false;
+          generateButton.textContent = "Generate";
+        }
+      }
+
+      async function renderPlacements(placements) {
+        if (placements.length === 0) {
+          return;
+        }
+
+        await Assets.load([...new Set(placements.map(({ url }) => url))]);
+        centerMap(calculateMapBounds(placements));
+        renderTitleOverlays(placements);
+
+        for (const placement of placements) {
+          const tile = await createHexTile(placement.url);
+          const position = hexToPixel(placement.q, placement.r);
+          const targetRotation = placement.rotation * TILE_ROTATION;
+
+          world.addChild(tile);
+          animateTilePlacement(tile, position.x, position.y, targetRotation);
+
+          await sleep(TILE_DELAY);
+        }
+      }
+
+      function clearWorld() {
+        for (const animate of activeAnimations) {
+          app.ticker.remove(animate);
+        }
+
+        activeAnimations.clear();
+        world.removeChildren();
+        titleLayer.replaceChildren();
+        currentPlacements = [];
+      }
+
+      function updateMapInfo(map) {
+        mapSeed.textContent = String(map.seed);
+        mapTileCount.textContent = String(map.placed_count);
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => {
+          setTimeout(resolve, ms);
+        });
+      }
+
+      function hexToPixel(q, r) {
+        return {
+          x: HEX_SIZE.x * (3 / 2 * q),
+          y: HEX_SIZE.y * (SQRT_3 / 2 * q + SQRT_3 * r),
+        };
+      }
+
+      function hexCornerOffset(corner) {
+        const angle = (2 * Math.PI * corner) / 6;
+
+        return {
+          x: HEX_SIZE.x * Math.cos(angle),
+          y: HEX_SIZE.y * Math.sin(angle),
+        };
+      }
+
+      function hexCornerPoints() {
+        const points = [];
+
+        for (let corner = 0; corner < 6; corner += 1) {
+          const offset = hexCornerOffset(corner);
+
+          points.push(offset.x, offset.y);
+        }
+
+        return points;
+      }
+
+      async function createHexTile(imageUrl) {
+        const tile = new Container();
+        const texture = await Assets.load(imageUrl);
+
+        const sprite = new Sprite(texture);
+        sprite.anchor.set(0.5);
+        scaleSpriteToCover(sprite);
+
+        const points = hexCornerPoints();
+        const mask = new Graphics().poly(points).fill(0xffffff);
+        const border = new Graphics().poly(points).stroke({
+          width: 2,
+          color: 0xffffff,
+        });
+
+        sprite.mask = mask;
+        tile.addChild(sprite, mask, border);
+
+        return tile;
+      }
+
+      function scaleSpriteToCover(sprite) {
+        const hexWidth = HEX_SIZE.x * 2;
+        const hexHeight = HEX_SIZE.y * SQRT_3;
+        const scale = Math.max(hexWidth / sprite.texture.width, hexHeight / sprite.texture.height);
+
+        sprite.scale.set(scale);
+      }
+
+      function animateTilePlacement(tile, targetX, targetY, targetRotation) {
+        const startY = targetY - DROP_DISTANCE;
+        const startRotation = targetRotation - 0.08;
+        let elapsed = 0;
+
+        tile.position.set(targetX, startY);
+        tile.scale.set(0.9);
+        tile.rotation = startRotation;
+        tile.alpha = 0;
+
+        const animate = (ticker) => {
+          elapsed += ticker.elapsedMS;
+
+          const progress = Math.min(elapsed / DROP_DURATION, 1);
+          const fallProgress = easeOutBounce(progress);
+          const smoothProgress = easeOutCubic(progress);
+
+          tile.y = startY + (targetY - startY) * fallProgress;
+          tile.alpha = Math.min(1, progress * 3);
+          tile.scale.set(0.9 + 0.1 * smoothProgress);
+          tile.rotation = startRotation + (targetRotation - startRotation) * smoothProgress;
+
+          if (progress >= 1) {
+            tile.position.set(targetX, targetY);
+            tile.scale.set(1);
+            tile.rotation = targetRotation;
+            tile.alpha = 1;
+
+            app.ticker.remove(animate);
+            activeAnimations.delete(animate);
+          }
+        };
+
+        activeAnimations.add(animate);
+        app.ticker.add(animate);
+      }
+
+      function easeOutCubic(t) {
+        return 1 - Math.pow(1 - t, 3);
+      }
+
+      function easeOutBounce(t) {
+        const n1 = 7.5625;
+        const d1 = 2.75;
+
+        if (t < 1 / d1) {
+          return n1 * t * t;
+        }
+
+        if (t < 2 / d1) {
+          t -= 1.5 / d1;
+
+          return n1 * t * t + 0.75;
+        }
+
+        if (t < 2.5 / d1) {
+          t -= 2.25 / d1;
+
+          return n1 * t * t + 0.9375;
+        }
+
+        t -= 2.625 / d1;
+
+        return n1 * t * t + 0.984375;
+      }
+
+      function calculateMapBounds(placements) {
+        const positions = placements.map(({ q, r }) => {
+          return hexToPixel(q, r);
+        });
+
+        const halfWidth = HEX_SIZE.x;
+        const halfHeight = (HEX_SIZE.y * SQRT_3) / 2;
+        const minX = Math.min(...positions.map(({ x }) => x)) - halfWidth;
+        const maxX = Math.max(...positions.map(({ x }) => x)) + halfWidth;
+        const minY = Math.min(...positions.map(({ y }) => y)) - halfHeight;
+        const maxY = Math.max(...positions.map(({ y }) => y)) + halfHeight;
+
+        return {
+          x: minX,
+          y: minY,
+          width: maxX - minX,
+          height: maxY - minY,
+        };
+      }
+
+      function centerMap(bounds) {
+        const padding = 40;
+        const availableWidth = Math.max(1, app.screen.width - padding * 2);
+        const availableHeight = Math.max(1, app.screen.height - padding * 2);
+        const scale = Math.min(1, availableWidth / bounds.width, availableHeight / bounds.height);
+
+        world.scale.set(scale);
+        world.position.set(
+          app.screen.width / 2 - (bounds.x + bounds.width / 2) * scale,
+          app.screen.height / 2 - (bounds.y + bounds.height / 2) * scale,
+        );
+      }
+
+      function renderTitleOverlays(placements) {
+        titleLayer.replaceChildren(
+          ...placements.map((placement) => {
+            const element = document.createElement("div");
+
+            element.className = "tile-title";
+            element.title = placement.title;
+            element.dataset.q = placement.q;
+            element.dataset.r = placement.r;
+
+            return element;
+          }),
+        );
+
+        positionTitleOverlays();
+      }
+
+      function positionTitleOverlays() {
+        const scale = world.scale.x;
+        const width = HEX_SIZE.x * 2 * scale;
+        const height = HEX_SIZE.y * SQRT_3 * scale;
+
+        for (const element of titleLayer.children) {
+          const position = hexToPixel(Number(element.dataset.q), Number(element.dataset.r));
+          const x = world.position.x + position.x * scale - width / 2;
+          const y = world.position.y + position.y * scale - height / 2;
+
+          element.style.left = `${x}px`;
+          element.style.top = `${y}px`;
+          element.style.width = `${width}px`;
+          element.style.height = `${height}px`;
+        }
+      }
+    </script>
+  </body>
+</html>
